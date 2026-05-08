@@ -6,6 +6,9 @@ dist/
 wheels/
 checkpoints/
 *.egg-info
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
 
 # Virtual environments
 .venv
@@ -19,6 +22,16 @@ checkpoints/
 .DS_Store
 tmp
 .wandb
+.env
+.env.*
+!.env.example
+*.log
+*.tmp
+*.bak
+*.bak_*
+*.fix
+*.v2a_fix
+local_archive/
 
 # Model checkpoints
 *.ckpt
@@ -41,7 +54,37 @@ tmp
 
 # Test outputs and benchmark logs
 outputs/
+output/
+output_*/
 benchmark_*.log
+logs/
+
+# Local profiler and NPU artifacts
+prof_data/
+kernel_meta/
+fusion_result.json
+*.json.bak
+*.o
+
+# Tensor dumps and precision/debug artifacts
+dump_*/
+mid_*/
+prep_*/
+probe_*/
+trace_*/
+pt/
+pt_*/
+precision_debug/
+precision_debug_*/
+
+# One-off local patch/debug scripts
+fix_*.py
+force_*.py
+patch_*.py
+restore_*.py
+sync_noise*.py
+final_safety_lock.py
+test_audio_fix.sh
 
 # Temporary test scripts
 run_004_tests.sh

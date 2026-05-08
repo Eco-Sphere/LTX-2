@@ -8,6 +8,8 @@
 
 **LTX-2** is the first DiT-based audio-video foundation model that contains all core capabilities of modern video generation in one model: synchronized audio and video, high fidelity, multiple performance modes, production-ready outputs, API access, and open access.
 
+For Ascend NPU setup and 8-card inference, see [README_NPU.md](README_NPU.md).
+
 <div align="center">
   <video src="https://github.com/user-attachments/assets/4414adc0-086c-43de-b367-9362eeb20228" width="70%" poster=""> </video>
 </div>

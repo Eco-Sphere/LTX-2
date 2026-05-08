@@ -1,5 +1,6 @@
 import logging
 import math
+import os
 from collections.abc import Generator, Iterator
 from fractions import Fraction
 from io import BytesIO
@@ -16,6 +17,13 @@ from ltx_core.types import Audio, VideoPixelShape
 from ltx_pipelines.utils.constants import DEFAULT_IMAGE_CRF
 
 logger = logging.getLogger(__name__)
+
+
+def _show_progress() -> bool:
+    if os.getenv("LTX_DISABLE_TQDM", "0") == "1":
+        return False
+    rank = int(os.getenv("RANK", os.getenv("LOCAL_RANK", "0")))
+    return rank == 0
 
 
 def resize_aspect_ratio_preserving(image: torch.Tensor, long_side: int) -> torch.Tensor:
@@ -225,7 +233,7 @@ def encode_video(
         yield first_chunk
         yield from tiles_generator
 
-    for video_chunk in tqdm(all_tiles(first_chunk, video), total=video_chunks_number):
+    for video_chunk in tqdm(all_tiles(first_chunk, video), total=video_chunks_number, disable=not _show_progress()):
         video_chunk_cpu = video_chunk.to("cpu").numpy()
         for frame_array in video_chunk_cpu:
             frame = av.VideoFrame.from_ndarray(frame_array, format="rgb24")

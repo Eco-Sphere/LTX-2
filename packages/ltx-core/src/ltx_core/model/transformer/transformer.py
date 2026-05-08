@@ -27,11 +27,13 @@ class BasicAVTransformerBlock(torch.nn.Module):
         idx: int,
         video: TransformerConfig | None = None,
         audio: TransformerConfig | None = None,
+        is_last_block: bool = False,
         rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
         norm_eps: float = 1e-6,
         attention_function: AttentionFunction | AttentionCallable = AttentionFunction.DEFAULT,
     ):
         super().__init__()
+        self.is_last_block = is_last_block
 
         self.idx = idx
         if video is not None:
@@ -123,6 +125,39 @@ class BasicAVTransformerBlock(torch.nn.Module):
 
         self.norm_eps = norm_eps
 
+    def _get_profiler(self):
+        import os
+
+        if os.getenv("LTX_PROFILE_DIT_PHASES", "0") != "1":
+            return None
+        try:
+            from ltx_npu.pipeline_wrapper import get_active_profiler
+
+            return get_active_profiler()
+        except Exception:
+            return None
+
+    def _phase(self, profiler, name: str):
+        import time
+
+        if profiler is None:
+            from contextlib import nullcontext
+
+            return nullcontext()
+
+        class _PhaseCtx:
+            def __enter__(self_inner):
+                profiler.sync()
+                self_inner.t0 = time.perf_counter()
+                return self_inner
+
+            def __exit__(self_inner, exc_type, exc, tb):
+                profiler.sync()
+                profiler.add_aggregate(name, time.perf_counter() - self_inner.t0)
+                return False
+
+        return _PhaseCtx()
+
     def get_ada_values(
         self, scale_shift_table: torch.Tensor, batch_size: int, timestep: torch.Tensor, indices: slice
     ) -> tuple[torch.Tensor, ...]:
@@ -204,174 +239,201 @@ class BasicAVTransformerBlock(torch.nn.Module):
         run_vx = video is not None and video.enabled and vx.numel() > 0
         run_ax = audio is not None and audio.enabled and ax.numel() > 0
 
-        run_a2v = run_vx and (audio is not None and ax.numel() > 0)
-        run_v2a = run_ax and (video is not None and vx.numel() > 0)
+        import os
+        run_a2v = os.getenv("LTX_ENABLE_A2V", "0") == "1"
+        run_v2a = os.getenv("LTX_ENABLE_V2A", "0") == "1"
+        profiler = self._get_profiler() if self.is_last_block else None
 
         if run_vx:
-            vshift_msa, vscale_msa, vgate_msa = self.get_ada_values(
-                self.scale_shift_table, vx.shape[0], video.timesteps, slice(0, 3)
-            )
-            norm_vx = rms_norm(vx, eps=self.norm_eps) * (1 + vscale_msa) + vshift_msa
-            del vshift_msa, vscale_msa
-
-            all_perturbed = perturbations.all_in_batch(PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx)
-            none_perturbed = not perturbations.any_in_batch(PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx)
-            v_mask = (
-                perturbations.mask_like(PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx, vx)
-                if not all_perturbed and not none_perturbed
-                else None
-            )
-            vx = (
-                vx
-                + self.attn1(
-                    norm_vx,
-                    pe=video.positional_embeddings,
-                    mask=video.self_attention_mask,
-                    perturbation_mask=v_mask,
-                    all_perturbed=all_perturbed,
+            with self._phase(profiler, "video.self_attn"):
+                vshift_msa, vscale_msa, vgate_msa = self.get_ada_values(
+                    self.scale_shift_table, vx.shape[0], video.timesteps, slice(0, 3)
                 )
-                * vgate_msa
-            )
-            del vgate_msa, norm_vx, v_mask
-            vx = vx + self._apply_text_cross_attention(
-                vx,
-                video.context,
-                self.attn2,
-                self.scale_shift_table,
-                getattr(self, "prompt_scale_shift_table", None),
-                video.timesteps,
-                video.prompt_timestep,
-                video.context_mask,
-                cross_attention_adaln=self.cross_attention_adaln,
-            )
+                norm_vx = rms_norm(vx, eps=self.norm_eps) * (1 + vscale_msa) + vshift_msa
+                del vshift_msa, vscale_msa
+
+                all_perturbed = perturbations.all_in_batch(PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx)
+                none_perturbed = not perturbations.any_in_batch(PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx)
+                v_mask = (
+                    perturbations.mask_like(PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx, vx)
+                    if not all_perturbed and not none_perturbed
+                    else None
+                )
+                vx = (
+                    vx
+                    + self.attn1(
+                        norm_vx,
+                        pe=video.positional_embeddings,
+                        mask=video.self_attention_mask,
+                        perturbation_mask=v_mask,
+                        all_perturbed=all_perturbed,
+                    )
+                    * vgate_msa
+                )
+                del vgate_msa, norm_vx, v_mask
+            with self._phase(profiler, "video.cross_attn"):
+                vx = vx + self._apply_text_cross_attention(
+                    vx,
+                    video.context,
+                    self.attn2,
+                    self.scale_shift_table,
+                    getattr(self, "prompt_scale_shift_table", None),
+                    video.timesteps,
+                    video.prompt_timestep,
+                    video.context_mask,
+                    cross_attention_adaln=self.cross_attention_adaln,
+                )
 
         if run_ax:
-            ashift_msa, ascale_msa, agate_msa = self.get_ada_values(
-                self.audio_scale_shift_table, ax.shape[0], audio.timesteps, slice(0, 3)
-            )
-
-            norm_ax = rms_norm(ax, eps=self.norm_eps) * (1 + ascale_msa) + ashift_msa
-            del ashift_msa, ascale_msa
-            all_perturbed = perturbations.all_in_batch(PerturbationType.SKIP_AUDIO_SELF_ATTN, self.idx)
-            none_perturbed = not perturbations.any_in_batch(PerturbationType.SKIP_AUDIO_SELF_ATTN, self.idx)
-            a_mask = (
-                perturbations.mask_like(PerturbationType.SKIP_AUDIO_SELF_ATTN, self.idx, ax)
-                if not all_perturbed and not none_perturbed
-                else None
-            )
-            ax = (
-                ax
-                + self.audio_attn1(
-                    norm_ax,
-                    pe=audio.positional_embeddings,
-                    mask=audio.self_attention_mask,
-                    perturbation_mask=a_mask,
-                    all_perturbed=all_perturbed,
+            with self._phase(profiler, "audio.self_attn"):
+                ashift_msa, ascale_msa, agate_msa = self.get_ada_values(
+                    self.audio_scale_shift_table, ax.shape[0], audio.timesteps, slice(0, 3)
                 )
-                * agate_msa
-            )
-            del agate_msa, norm_ax, a_mask
-            ax = ax + self._apply_text_cross_attention(
-                ax,
-                audio.context,
-                self.audio_attn2,
-                self.audio_scale_shift_table,
-                getattr(self, "audio_prompt_scale_shift_table", None),
-                audio.timesteps,
-                audio.prompt_timestep,
-                audio.context_mask,
-                cross_attention_adaln=self.cross_attention_adaln,
-            )
+
+                norm_ax = rms_norm(ax, eps=self.norm_eps) * (1 + ascale_msa) + ashift_msa
+                del ashift_msa, ascale_msa
+                all_perturbed = perturbations.all_in_batch(PerturbationType.SKIP_AUDIO_SELF_ATTN, self.idx)
+                none_perturbed = not perturbations.any_in_batch(PerturbationType.SKIP_AUDIO_SELF_ATTN, self.idx)
+                a_mask = (
+                    perturbations.mask_like(PerturbationType.SKIP_AUDIO_SELF_ATTN, self.idx, ax)
+                    if not all_perturbed and not none_perturbed
+                    else None
+                )
+                ax = (
+                    ax
+                    + self.audio_attn1(
+                        norm_ax,
+                        pe=audio.positional_embeddings,
+                        mask=audio.self_attention_mask,
+                        perturbation_mask=a_mask,
+                        all_perturbed=all_perturbed,
+                    )
+                    * agate_msa
+                )
+                del agate_msa, norm_ax, a_mask
+            with self._phase(profiler, "audio.cross_attn"):
+                ax = ax + self._apply_text_cross_attention(
+                    ax,
+                    audio.context,
+                    self.audio_attn2,
+                    self.audio_scale_shift_table,
+                    getattr(self, "audio_prompt_scale_shift_table", None),
+                    audio.timesteps,
+                    audio.prompt_timestep,
+                    audio.context_mask,
+                    cross_attention_adaln=self.cross_attention_adaln,
+                )
 
         # Audio - Video cross attention.
         if run_a2v or run_v2a:
             vx_norm3 = rms_norm(vx, eps=self.norm_eps)
             ax_norm3 = rms_norm(ax, eps=self.norm_eps)
 
-            if run_a2v and not perturbations.all_in_batch(PerturbationType.SKIP_A2V_CROSS_ATTN, self.idx):
-                scale_ca_video_a2v, shift_ca_video_a2v, gate_out_a2v = self.get_av_ca_ada_values(
-                    self.scale_shift_table_a2v_ca_video,
-                    vx.shape[0],
-                    video.cross_scale_shift_timestep,
-                    video.cross_gate_timestep,
-                    slice(0, 2),
-                )
-                vx_scaled = vx_norm3 * (1 + scale_ca_video_a2v) + shift_ca_video_a2v
-                del scale_ca_video_a2v, shift_ca_video_a2v
-
-                scale_ca_audio_a2v, shift_ca_audio_a2v, _ = self.get_av_ca_ada_values(
-                    self.scale_shift_table_a2v_ca_audio,
-                    ax.shape[0],
-                    audio.cross_scale_shift_timestep,
-                    audio.cross_gate_timestep,
-                    slice(0, 2),
-                )
-                ax_scaled = ax_norm3 * (1 + scale_ca_audio_a2v) + shift_ca_audio_a2v
-                del scale_ca_audio_a2v, shift_ca_audio_a2v
-                a2v_mask = perturbations.mask_like(PerturbationType.SKIP_A2V_CROSS_ATTN, self.idx, vx)
-                vx = vx + (
-                    self.audio_to_video_attn(
-                        vx_scaled,
-                        context=ax_scaled,
-                        pe=video.cross_positional_embeddings,
-                        k_pe=audio.cross_positional_embeddings,
-                    )
-                    * gate_out_a2v
-                    * a2v_mask
-                )
-                del gate_out_a2v, a2v_mask, vx_scaled, ax_scaled
-
+            v2a_gather = None
             if run_v2a and not perturbations.all_in_batch(PerturbationType.SKIP_V2A_CROSS_ATTN, self.idx):
-                scale_ca_audio_v2a, shift_ca_audio_v2a, gate_out_v2a = self.get_av_ca_ada_values(
-                    self.scale_shift_table_a2v_ca_audio,
-                    ax.shape[0],
-                    audio.cross_scale_shift_timestep,
-                    audio.cross_gate_timestep,
-                    slice(2, 4),
-                )
-                ax_scaled = ax_norm3 * (1 + scale_ca_audio_v2a) + shift_ca_audio_v2a
-                del scale_ca_audio_v2a, shift_ca_audio_v2a
-                scale_ca_video_v2a, shift_ca_video_v2a, _ = self.get_av_ca_ada_values(
-                    self.scale_shift_table_a2v_ca_video,
-                    vx.shape[0],
-                    video.cross_scale_shift_timestep,
-                    video.cross_gate_timestep,
-                    slice(2, 4),
-                )
-                vx_scaled = vx_norm3 * (1 + scale_ca_video_v2a) + shift_ca_video_v2a
-                del scale_ca_video_v2a, shift_ca_video_v2a
-                v2a_mask = perturbations.mask_like(PerturbationType.SKIP_V2A_CROSS_ATTN, self.idx, ax)
-                ax = ax + (
-                    self.video_to_audio_attn(
-                        ax_scaled,
-                        context=vx_scaled,
-                        pe=audio.cross_positional_embeddings,
+                try:
+                    from ltx_npu.ulysses_attn import start_v2a_context_gather
+                    v2a_gather = start_v2a_context_gather(
+                        self.video_to_audio_attn,
+                        context=vx,
                         k_pe=video.cross_positional_embeddings,
                     )
-                    * gate_out_v2a
-                    * v2a_mask
-                )
-                del gate_out_v2a, v2a_mask, ax_scaled, vx_scaled
+                except Exception:
+                    v2a_gather = None
+
+            if run_a2v and not perturbations.all_in_batch(PerturbationType.SKIP_A2V_CROSS_ATTN, self.idx):
+                with self._phase(profiler, "a2v.cross_attn"):
+                    scale_ca_video_a2v, shift_ca_video_a2v, gate_out_a2v = self.get_av_ca_ada_values(
+                        self.scale_shift_table_a2v_ca_video,
+                        vx.shape[0],
+                        video.cross_scale_shift_timestep,
+                        video.cross_gate_timestep,
+                        slice(0, 2),
+                    )
+                    vx_scaled = vx_norm3 * (1 + scale_ca_video_a2v) + shift_ca_video_a2v
+                    del scale_ca_video_a2v, shift_ca_video_a2v
+
+                    scale_ca_audio_a2v, shift_ca_audio_a2v, _ = self.get_av_ca_ada_values(
+                        self.scale_shift_table_a2v_ca_audio,
+                        ax.shape[0],
+                        audio.cross_scale_shift_timestep,
+                        audio.cross_gate_timestep,
+                        slice(0, 2),
+                    )
+                    ax_scaled = ax_norm3 * (1 + scale_ca_audio_a2v) + shift_ca_audio_a2v
+                    del scale_ca_audio_a2v, shift_ca_audio_a2v
+                    a2v_mask = perturbations.mask_like(PerturbationType.SKIP_A2V_CROSS_ATTN, self.idx, vx)
+                    vx = vx + (
+                        self.audio_to_video_attn(
+                            vx_scaled,
+                            context=ax_scaled,
+                            pe=video.cross_positional_embeddings,
+                            k_pe=audio.cross_positional_embeddings,
+                        )
+                        * gate_out_a2v
+                        * a2v_mask
+                    )
+                    del gate_out_a2v, a2v_mask, vx_scaled, ax_scaled
+
+            if run_v2a and not perturbations.all_in_batch(PerturbationType.SKIP_V2A_CROSS_ATTN, self.idx):
+                with self._phase(profiler, "v2a.cross_attn"):
+                    if v2a_gather is not None:
+                        vx_gathered, k_pe_gathered = v2a_gather.wait()
+                    else:
+                        vx_gathered = vx
+                        k_pe_gathered = video.cross_positional_embeddings
+                    scale_ca_audio_v2a, shift_ca_audio_v2a, gate_out_v2a = self.get_av_ca_ada_values(
+                        self.scale_shift_table_a2v_ca_audio,
+                        ax.shape[0],
+                        audio.cross_scale_shift_timestep,
+                        audio.cross_gate_timestep,
+                        slice(2, 4),
+                    )
+                    ax_scaled = ax_norm3 * (1 + scale_ca_audio_v2a) + shift_ca_audio_v2a
+                    del scale_ca_audio_v2a, shift_ca_audio_v2a
+                    scale_ca_video_v2a, shift_ca_video_v2a, _ = self.get_av_ca_ada_values(
+                        self.scale_shift_table_a2v_ca_video,
+                        vx.shape[0],
+                        video.cross_scale_shift_timestep,
+                        video.cross_gate_timestep,
+                        slice(2, 4),
+                    )
+                    vx_scaled = vx_norm3 * (1 + scale_ca_video_v2a) + shift_ca_video_v2a
+                    del scale_ca_video_v2a, shift_ca_video_v2a
+                    v2a_mask = perturbations.mask_like(PerturbationType.SKIP_V2A_CROSS_ATTN, self.idx, ax)
+                    ax = ax + (
+                        self.video_to_audio_attn(
+                            ax_scaled,
+                            context=vx_gathered if v2a_gather is not None else vx_scaled,
+                            pe=audio.cross_positional_embeddings,
+                            k_pe=k_pe_gathered,
+                        )
+                        * gate_out_v2a
+                        * v2a_mask
+                    )
+                    del gate_out_v2a, v2a_mask, ax_scaled, vx_scaled
 
             del vx_norm3, ax_norm3
 
         if run_vx:
-            vshift_mlp, vscale_mlp, vgate_mlp = self.get_ada_values(
-                self.scale_shift_table, vx.shape[0], video.timesteps, slice(3, 6)
-            )
-            vx_scaled = rms_norm(vx, eps=self.norm_eps) * (1 + vscale_mlp) + vshift_mlp
-            vx = vx + self.ff(vx_scaled) * vgate_mlp
+            with self._phase(profiler, "video.mlp"):
+                vshift_mlp, vscale_mlp, vgate_mlp = self.get_ada_values(
+                    self.scale_shift_table, vx.shape[0], video.timesteps, slice(3, 6)
+                )
+                vx_scaled = rms_norm(vx, eps=self.norm_eps) * (1 + vscale_mlp) + vshift_mlp
+                vx = vx + self.ff(vx_scaled) * vgate_mlp
 
-            del vshift_mlp, vscale_mlp, vgate_mlp, vx_scaled
+                del vshift_mlp, vscale_mlp, vgate_mlp, vx_scaled
 
         if run_ax:
-            ashift_mlp, ascale_mlp, agate_mlp = self.get_ada_values(
-                self.audio_scale_shift_table, ax.shape[0], audio.timesteps, slice(3, 6)
-            )
-            ax_scaled = rms_norm(ax, eps=self.norm_eps) * (1 + ascale_mlp) + ashift_mlp
-            ax = ax + self.audio_ff(ax_scaled) * agate_mlp
+            with self._phase(profiler, "audio.mlp"):
+                ashift_mlp, ascale_mlp, agate_mlp = self.get_ada_values(
+                    self.audio_scale_shift_table, ax.shape[0], audio.timesteps, slice(3, 6)
+                )
+                ax_scaled = rms_norm(ax, eps=self.norm_eps) * (1 + ascale_mlp) + ashift_mlp
+                ax = ax + self.audio_ff(ax_scaled) * agate_mlp
 
-            del ashift_mlp, ascale_mlp, agate_mlp, ax_scaled
+                del ashift_mlp, ascale_mlp, agate_mlp, ax_scaled
 
         return replace(video, x=vx) if video is not None else None, replace(audio, x=ax) if audio is not None else None
 

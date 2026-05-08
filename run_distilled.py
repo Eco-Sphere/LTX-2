@@ -1,3 +1,88 @@
+
+# LTX_RANK0_ONLY_OUTPUT_ARGV_PATCH
+# Only rank0 writes the requested final output path.
+# Non-main ranks rewrite --output-path in sys.argv before argparse parses it.
+import os as _ltx_rank_os
+import sys as _ltx_rank_sys
+
+_ltx_rank = int(_ltx_rank_os.getenv("RANK", _ltx_rank_os.getenv("LOCAL_RANK", "0")))
+
+if _ltx_rank != 0 and "--output-path" in _ltx_rank_sys.argv:
+    _i = _ltx_rank_sys.argv.index("--output-path")
+    if _i + 1 < len(_ltx_rank_sys.argv):
+        _orig_out = _ltx_rank_sys.argv[_i + 1]
+        _out_dir = _ltx_rank_os.path.dirname(_orig_out) or "."
+        _out_base = _ltx_rank_os.path.basename(_orig_out)
+        _ltx_rank_sys.argv[_i + 1] = _ltx_rank_os.path.join(
+            _out_dir,
+            f".rank{_ltx_rank}_{_out_base}",
+        )
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+if not hasattr(F, "_ltx_npu_conv_patched"):
+    _orig_F_conv1d = F.conv1d
+
+    def _patched_F_conv1d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
+        if torch.is_tensor(input) and input.dtype != weight.dtype:
+            input = input.to(weight.dtype)
+        return _orig_F_conv1d(input, weight, bias, stride, padding, dilation, groups)
+
+    F.conv1d = _patched_F_conv1d
+
+    _orig_F_conv2d = F.conv2d
+
+    def _patched_F_conv2d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
+        if torch.is_tensor(input) and input.dtype != weight.dtype:
+            input = input.to(weight.dtype)
+        return _orig_F_conv2d(input, weight, bias, stride, padding, dilation, groups)
+
+    F.conv2d = _patched_F_conv2d
+
+    _orig_nn_conv1d = nn.Conv1d.forward
+
+    def _patched_nn_conv1d(self, input):
+        if torch.is_tensor(input) and input.dtype != self.weight.dtype:
+            input = input.to(self.weight.dtype)
+        return _orig_nn_conv1d(self, input)
+
+    nn.Conv1d.forward = _patched_nn_conv1d
+
+    _orig_nn_conv2d = nn.Conv2d.forward
+
+    def _patched_nn_conv2d(self, input):
+        if torch.is_tensor(input) and input.dtype != self.weight.dtype:
+            input = input.to(self.weight.dtype)
+        return _orig_nn_conv2d(self, input)
+
+    nn.Conv2d.forward = _patched_nn_conv2d
+    F._ltx_npu_conv_patched = True
+
+from ltx_core.model.audio_vae.vocoder import Vocoder
+
+if not hasattr(Vocoder, "_fp32_patched"):
+    _orig_vocoder_forward = Vocoder.forward
+
+    def _patched_vocoder_forward(self, mel_spec):
+        if _ltx_rank_os.getenv("LTX_VOCODER_FORCE_FP32", "0") == "1":
+            if next(self.parameters()).dtype != torch.float32:
+                self.to(torch.float32)
+        else:
+            try:
+                p = next(self.parameters())
+            except StopIteration:
+                p = None
+            if p is not None and torch.is_tensor(mel_spec):
+                if mel_spec.device != p.device:
+                    mel_spec = mel_spec.to(p.device)
+                if mel_spec.is_floating_point() and mel_spec.dtype != p.dtype:
+                    mel_spec = mel_spec.to(p.dtype)
+        return _orig_vocoder_forward(self, mel_spec)
+
+    Vocoder.forward = _patched_vocoder_forward
+    Vocoder._fp32_patched = True
 """Multi-card DistilledPipeline entry point for Ascend NPU.
 
 Usage:
@@ -13,7 +98,6 @@ Usage:
 
 import logging
 import os
-import sys
 
 import torch
 
@@ -44,6 +128,11 @@ def build_arg_parser():
         "--no-warmup", action="store_true", default=False,
         help="Skip warmup inference (for debugging; timing will include NPU compilation overhead).",
     )
+    parser.add_argument(
+        "--audio-path", type=str, default=None,
+        help="Path to external WAV audio file. When provided, this audio is muxed "
+             "directly and bypasses model audio generation.",
+    )
     return parser
 
 
@@ -58,7 +147,6 @@ def main() -> None:
 
     parser = build_arg_parser()
     args = parser.parse_args()
-
     pcfg = ParallelConfig.from_args(args)
 
     if pcfg.is_main:
@@ -78,11 +166,24 @@ def main() -> None:
         spatial_upsampler_path=args.spatial_upsampler_path,
         loras=tuple(args.lora) if args.lora else (),
         quantization=args.quantization,
-        torch_compile=args.compile,
+        torch_compile=getattr(args,"compile",False),
     )
-
     tiling_config = TilingConfig.default()
     video_chunks_number = get_video_chunks_number(args.num_frames, tiling_config)
+
+    if os.environ.get("LTX_NPU_PROFILE") == "1":
+        from torch_npu.profiler import profile, ProfilerActivity, tensorboard_trace_handler
+        _prof_dir = os.environ.get("LTX_NPU_PROFILE_DIR", "./prof_data")
+        os.makedirs(_prof_dir, exist_ok=True)
+        _prof_name = os.environ.get("LTX_NPU_PROFILE_NAME", "npu_trace")
+        _prof = profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.NPU],
+            record_shapes=True,
+            with_stack=True,
+            on_trace_ready=tensorboard_trace_handler(f"{_prof_dir}/{_prof_name}"),
+        )
+        _prof.start()
+        logger.info("NPU profiler started, output: %s/%s", _prof_dir, _prof_name)
 
     result = pipeline.run_with_timing(
         prompt=args.prompt,
@@ -98,8 +199,22 @@ def main() -> None:
         warmup=not args.no_warmup,
     )
 
+    if os.environ.get("LTX_NPU_PROFILE") == "1":
+        _prof.stop()
+        logger.info("NPU profiler stopped")
+
     if pcfg.is_main and result is not None:
         video, audio = result
+        if args.audio_path:
+            from scipy.io import wavfile
+            sr, waveform_np = wavfile.read(args.audio_path)
+            if waveform_np.ndim == 1:
+                waveform_np = waveform_np[:, None]
+            waveform = torch.from_numpy(waveform_np.T.copy()).unsqueeze(0).float() / 32768.0
+            from ltx_core.types import Audio
+            audio = Audio(waveform=waveform, sampling_rate=sr)
+            logger.info("Using external audio: %s (%dHz, %.1fs)",
+                        args.audio_path, sr, waveform.shape[-1] / sr)
         encode_video(
             video=video,
             fps=args.frame_rate,

@@ -1,4 +1,5 @@
 import logging
+import os
 from collections.abc import Iterator
 
 import torch
@@ -131,7 +132,8 @@ class DistilledPipeline:
             streaming_prefetch_count=streaming_prefetch_count,
         )
 
-        # Stage 2: Upsample and refine the video at higher resolution with distilled LORA.
+        # Stage 2: Upsample and refine video only at higher resolution.
+        # Audio is NOT refined — Stage 2 is video-only.
         upscaled_video_latent = self.upsampler(video_state.latent[:1])
 
         stage_2_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(self.device)
@@ -146,7 +148,9 @@ class DistilledPipeline:
             )
         )
 
-        video_state, audio_state = self.stage(
+        stage_2_video_only = os.getenv("LTX_STAGE2_VIDEO_ONLY", "1") == "1"
+        stage_1_audio_state = audio_state
+        video_state, stage_2_audio_state = self.stage(
             denoiser=SimpleDenoiser(video_context, audio_context),
             sigmas=stage_2_sigmas,
             noiser=noiser,
@@ -160,16 +164,45 @@ class DistilledPipeline:
                 noise_scale=stage_2_sigmas[0].item(),
                 initial_latent=upscaled_video_latent,
             ),
-            audio=ModalitySpec(
+            audio=None
+            if stage_2_video_only
+            else ModalitySpec(
                 context=audio_context,
                 noise_scale=stage_2_sigmas[0].item(),
                 initial_latent=audio_state.latent,
             ),
             streaming_prefetch_count=streaming_prefetch_count,
         )
+        audio_state = stage_1_audio_state if stage_2_video_only else stage_2_audio_state
 
         decoded_video = self.video_decoder(video_state.latent, tiling_config, generator)
-        decoded_audio = self.audio_decoder(audio_state.latent)
+
+        decoded_audio = None
+        if audio_state is not None:
+            _audio_latent = audio_state.latent
+
+            # Dump final audio latent for precision debugging
+            if os.environ.get("LTX_DUMP_AUDIO_LATENT") == "1":
+                _dump_dir = os.environ.get("LTX_DUMP_AUDIO_LATENT_DIR", "./")
+                os.makedirs(_dump_dir, exist_ok=True)
+                _dump_name = os.environ.get("LTX_DUMP_AUDIO_LATENT_NAME", "final_audio_latent.pt")
+                _rank = os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))
+                _base, _ext = os.path.splitext(_dump_name)
+                _fname = f"{_base}_rank{_rank}{_ext}"
+                torch.save(_audio_latent.detach().cpu(), os.path.join(_dump_dir, _fname))
+                logging.getLogger("distilled").info("Dumped final audio latent rank=%s to %s/%s", _rank, _dump_dir, _fname)
+
+            # Latent override for cross-decode testing
+            _override = os.environ.get("LTX_AUDIO_LATENT_OVERRIDE_PATH", "")
+            if _override:
+                _loaded = torch.load(_override, map_location="cpu")
+                if isinstance(_loaded, dict) and "latent" in _loaded:
+                    _loaded = _loaded["latent"]
+                _audio_latent = _loaded.to(device=_audio_latent.device, dtype=_audio_latent.dtype)
+                logging.getLogger("distilled").info(
+                    "Using overridden audio latent from %s, shape=%s", _override, tuple(_audio_latent.shape))
+
+            decoded_audio = self.audio_decoder(_audio_latent)
         return decoded_video, decoded_audio
 
 

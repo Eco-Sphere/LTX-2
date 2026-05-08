@@ -1,4 +1,5 @@
 import logging
+import os
 from dataclasses import replace
 from functools import partial
 from typing import Callable
@@ -15,6 +16,13 @@ from ltx_pipelines.utils.res2s import get_res2s_coefficients
 from ltx_pipelines.utils.types import Denoiser, LatentState
 
 logger = logging.getLogger(__name__)
+
+
+def _show_progress() -> bool:
+    if os.getenv("LTX_DISABLE_TQDM", "0") == "1":
+        return False
+    rank = int(os.getenv("RANK", os.getenv("LOCAL_RANK", "0")))
+    return rank == 0
 
 
 def _step_state(
@@ -65,7 +73,7 @@ def euler_denoising_loop(
     tuple[LatentState | None, LatentState | None]
         Final ``(video_state, audio_state)`` after the denoising loop.
     """
-    for step_idx, _ in enumerate(tqdm(sigmas[:-1])):
+    for step_idx, _ in enumerate(tqdm(sigmas[:-1], disable=not _show_progress())):
         denoised_video, denoised_audio = denoiser(transformer, video_state, audio_state, sigmas, step_idx)
 
         video_state = _step_state(video_state, denoised_video, stepper, sigmas, step_idx)
@@ -109,7 +117,7 @@ def gradient_estimating_euler_denoising_loop(
             denoised_sample = to_denoised(noisy_sample, total_velocity, sigma)
         return current_velocity, denoised_sample
 
-    for step_idx, _ in enumerate(tqdm(sigmas[:-1])):
+    for step_idx, _ in enumerate(tqdm(sigmas[:-1], disable=not _show_progress())):
         denoised_video, denoised_audio = denoiser(transformer, video_state, audio_state, sigmas, step_idx)
 
         if video_state is not None and denoised_video is not None:
@@ -267,7 +275,7 @@ def res2s_audio_video_denoising_loop(  # noqa: PLR0913,PLR0915,PLR0912
     phi_cache = {}
     c2 = 0.5  # Midpoint for res_2s
 
-    for step_idx in tqdm(range(n_full_steps)):
+    for step_idx in tqdm(range(n_full_steps), disable=not _show_progress()):
         sigma = sigmas[step_idx].double()
         sigma_next = sigmas[step_idx + 1].double()
 

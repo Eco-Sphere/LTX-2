@@ -31,6 +31,7 @@ class PipelineProfiler:
     def __init__(self, ctx: DeviceContext | None = None):
         self._ctx = ctx
         self._records: list[tuple[str, float]] = []
+        self._aggregate_records: dict[str, tuple[float, int]] = {}
         self._model_counts: dict[str, int] = {}
         self._last_gpu_model_exit: float | None = None
         self._gpu_model_depth: int = 0
@@ -53,6 +54,11 @@ class PipelineProfiler:
         """Add a pre-measured timing entry."""
         self._records.append((name, elapsed))
 
+    def add_aggregate(self, name: str, elapsed: float) -> None:
+        """Accumulate timing under a shared label."""
+        total, count = self._aggregate_records.get(name, (0.0, 0))
+        self._aggregate_records[name] = (total + elapsed, count + 1)
+
     def next_label(self, base: str) -> str:
         """Return a unique label: 'Foo' first time, 'Foo#2' second time, etc."""
         self._model_counts[base] = self._model_counts.get(base, 0) + 1
@@ -64,7 +70,8 @@ class PipelineProfiler:
 
     def report(self) -> str:
         if not self._records:
-            return "[PipelineProfiler] No records."
+            if not self._aggregate_records:
+                return "[PipelineProfiler] No records."
 
         total = self.total()
         name_w = max(max(len(n) for n, _ in self._records), len("Operation")) + 2
@@ -83,6 +90,17 @@ class PipelineProfiler:
         for name, elapsed in self._records:
             pct = f"{elapsed / total * 100:.1f}" if total > 0 else "0.0"
             lines.append(row(name, elapsed, pct))
+        if self._aggregate_records:
+            lines.append(f"├{'─' * name_w}┼{'─' * time_w}┼{'─' * pct_w}┤")
+            lines.append(row("Aggregates", 0.0, ""))
+            agg_total = sum(total for total, _ in self._aggregate_records.values())
+            for name, (agg_elapsed, count) in sorted(
+                self._aggregate_records.items(), key=lambda item: item[1][0], reverse=True
+            ):
+                avg = agg_elapsed / max(1, count)
+                pct = f"{agg_elapsed / agg_total * 100:.1f}" if agg_total > 0 else "0.0"
+                lines.append(f"│ {name:<{name_w - 2}} │{agg_elapsed:>{time_w - 2}.3f}  │{pct:>{pct_w - 2}}  │")
+                lines.append(f"│ {'avg='+format(avg, '.3f')+', n='+str(count):<{name_w - 2}} │{'':>{time_w - 2}}  │{'':>{pct_w - 2}}  │")
         lines.append(f"├{'─' * name_w}┼{'─' * time_w}┼{'─' * pct_w}┤")
         lines.append(row("TOTAL", total, "100.0"))
         lines.append(f"└{'─' * name_w}┴{'─' * time_w}┴{'─' * pct_w}┘")
@@ -91,6 +109,7 @@ class PipelineProfiler:
     def reset(self) -> None:
         """Clear all records and counters for a fresh profiling run."""
         self._records.clear()
+        self._aggregate_records.clear()
         self._model_counts.clear()
         self._last_gpu_model_exit = time.perf_counter()
         self._gpu_model_depth = 0

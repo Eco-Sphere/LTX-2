@@ -494,15 +494,29 @@ class AudioDecoder(torch.nn.Module):
 
 
 def decode_audio(latent: torch.Tensor, audio_decoder: "AudioDecoder", vocoder: "Vocoder") -> Audio:
-    """
-    Decode an audio latent representation using the provided audio decoder and vocoder.
-    Args:
-        latent: Input audio latent tensor.
-        audio_decoder: Model to decode the latent to waveform features.
-        vocoder: Model to convert decoded features to audio waveform.
-    Returns:
-        Decoded audio with waveform and sampling rate.
-    """
-    decoded_audio = audio_decoder(latent)
-    waveform = vocoder(decoded_audio).squeeze(0).float()
+    import torch
+    import torch.distributed as dist
+    from ltx_core.types import Audio
+
+    # 绝杀：非主卡直接返回空白音频秒退，杜绝 8 卡 CPU 打架！
+    if dist.is_initialized() and dist.get_rank() != 0:
+        return Audio(waveform=torch.zeros(1, 1), sampling_rate=vocoder.output_sampling_rate)
+
+    # 主卡独享：临时解除 PyTorch 分布式单线程封印，分配 16 个线程极速解码
+    old_threads = torch.get_num_threads()
+    torch.set_num_threads(16)
+
+    try:
+        # 同时关闭 NPU 和 CPU 的 autocast，彻底屏蔽满屏的 UserWarning
+        with torch.autocast(device_type="npu", enabled=False), torch.autocast(device_type="cpu", enabled=False), torch.no_grad():
+            latent_cpu = latent.to(device="cpu", dtype=torch.float32)
+            audio_decoder_cpu = audio_decoder.to(device="cpu", dtype=torch.float32)
+            vocoder_cpu = vocoder.to(device="cpu", dtype=torch.float32)
+            
+            decoded_audio = audio_decoder_cpu(latent_cpu)
+            waveform = vocoder_cpu(decoded_audio).squeeze(0).float()
+    finally:
+        # 恢复线程设置，保持环保
+        torch.set_num_threads(old_threads)
+        
     return Audio(waveform=waveform, sampling_rate=vocoder.output_sampling_rate)

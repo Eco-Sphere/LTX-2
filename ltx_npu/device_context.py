@@ -105,7 +105,7 @@ class NPUDeviceContext(DeviceContext):
     def cleanup_processes(self) -> None:
         try:
             subprocess.run(
-                ["bash", os.path.join(os.path.dirname(__file__), "..", "scripts", "clean_npu.sh")],
+                ["bash", os.path.join(os.path.dirname(__file__), "..", "examples", "scripts", "clean_npu.sh")],
                 check=False, capture_output=True,
             )
         except FileNotFoundError:

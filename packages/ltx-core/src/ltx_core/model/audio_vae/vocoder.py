@@ -573,7 +573,7 @@ class VocoderWithBWE(nn.Module):
         # Tested: both approaches produce bit-identical output.
 
         with torch.autocast(device_type=mel_spec.device.type, dtype=torch.float32):
-            x = self.vocoder(mel_spec.float())
+            x = self.vocoder(mel_spec)
             _, _, length_low_rate = x.shape
             output_length = length_low_rate * self.output_sampling_rate // self.input_sampling_rate
 

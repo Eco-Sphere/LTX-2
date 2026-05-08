@@ -132,6 +132,7 @@ class TransformerArgsPreprocessor:
         x_dtype: torch.dtype,
     ) -> torch.Tensor:
         """Prepare positional embeddings."""
+        positions = positions.float()
         freq_grid_generator = generate_freq_grid_np if self.double_precision_rope else generate_freq_grid_pytorch
         pe = precompute_freqs_cis(
             positions,

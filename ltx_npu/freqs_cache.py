@@ -27,8 +27,9 @@ _ORIGINAL_FN_ATTR = "_original_prepare_positional_embeddings"
 def install_freqs_cache(preprocessor: Any) -> None:
     """Monkey-patch _prepare_positional_embeddings to cache (cos, sin) results.
 
-    The cache key is (positions.shape, inner_dim, rope_type) — invariant
-    within a single DiffusionStage.
+    The cache key includes all arguments that affect RoPE values.  In
+    multimodal models video/audio preprocessors may share shapes while using
+    different position grids or max_pos/head settings.
     """
     if hasattr(preprocessor, _ORIGINAL_FN_ATTR):
         return
@@ -46,8 +47,21 @@ def install_freqs_cache(preprocessor: Any) -> None:
         num_attention_heads: int,
         x_dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        positions = positions.float()
         cache = getattr(preprocessor, _CACHE_ATTR, None)
-        cache_key = (tuple(positions.shape), inner_dim, preprocessor.rope_type)
+        cache_key = (
+            tuple(positions.shape),
+            str(positions.device),
+            str(positions.dtype),
+            float(positions.detach().float().sum().cpu().item()),
+            float(positions.detach().float().abs().sum().cpu().item()),
+            inner_dim,
+            tuple(max_pos),
+            bool(use_middle_indices_grid),
+            num_attention_heads,
+            str(x_dtype),
+            preprocessor.rope_type,
+        )
 
         if cache is not None and cache[0] == cache_key:
             return cache[1]

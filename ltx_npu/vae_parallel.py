@@ -18,17 +18,77 @@ import torch.nn.functional as F
 logger = logging.getLogger(__name__)
 
 
+def _all_gather_patches(local_x: torch.Tensor, world_size: int) -> list[torch.Tensor]:
+    """Gather same-shaped local patches with the fastest available collective."""
+    if world_size <= 1:
+        return [local_x]
+
+    try:
+        if hasattr(dist, "all_gather_into_tensor"):
+            out = torch.empty(
+                (world_size, *local_x.shape),
+                dtype=local_x.dtype,
+                device=local_x.device,
+            )
+            dist.all_gather_into_tensor(out, local_x.contiguous())
+            return list(out.unbind(0))
+    except Exception:
+        pass
+
+    gathered = [torch.zeros_like(local_x) for _ in range(world_size)]
+    dist.all_gather(gathered, local_x.contiguous())
+    return gathered
+
+
+def _exchange_peer_tensors(send_to: int | None, send_tensor: torch.Tensor | None, recv_from: int | None, recv_tensor: torch.Tensor | None) -> None:
+    """Non-blocking peer exchange to avoid serialized send/recv handshakes."""
+    ops = []
+    if recv_from is not None and recv_tensor is not None:
+        ops.append(dist.P2POp(dist.irecv, recv_tensor, recv_from))
+    if send_to is not None and send_tensor is not None:
+        ops.append(dist.P2POp(dist.isend, send_tensor, send_to))
+    if ops:
+        reqs = dist.batch_isend_irecv(ops)
+        for req in reqs:
+            req.wait()
+
+
+
 def _compute_grid(world_size: int) -> tuple[int, int]:
     """Compute (h_split, w_split) grid for a given world_size."""
+    import os
+
     if world_size <= 1:
         return 1, 1
-    # Prefer taller grids (more H splits)
+
+    grid_env = os.getenv("LTX_VAE_GRID", "").strip().lower()
+    if grid_env:
+        if "x" not in grid_env:
+            raise ValueError(f"LTX_VAE_GRID must look like HxW, got: {grid_env}")
+        h, w = [int(x) for x in grid_env.split("x", 1)]
+        if h <= 0 or w <= 0 or h * w != world_size:
+            raise ValueError(
+                f"LTX_VAE_GRID={grid_env} invalid for world_size={world_size}; need h*w == world_size"
+            )
+        return h, w
+
+    h_env = os.getenv("LTX_VAE_H_SPLIT", "").strip()
+    w_env = os.getenv("LTX_VAE_W_SPLIT", "").strip()
+    if h_env and w_env:
+        h = int(h_env)
+        w = int(w_env)
+        if h <= 0 or w <= 0 or h * w != world_size:
+            raise ValueError(
+                f"LTX_VAE_H_SPLIT={h}, LTX_VAE_W_SPLIT={w} invalid for world_size={world_size}; need h*w == world_size"
+            )
+        return h, w
+
+    # default heuristic: keep current behavior
     w = int(math.sqrt(world_size))
     while world_size % w != 0:
         w -= 1
     h = world_size // w
     return h, w
-
 
 class VAEParallelContext:
     """Manages spatial patch distribution for parallel VAE decoding."""
@@ -76,8 +136,7 @@ class VAEParallelContext:
         if self.world_size <= 1:
             return local_x
 
-        gathered = [torch.zeros_like(local_x) for _ in range(self.world_size)]
-        dist.all_gather(gathered, local_x)
+        gathered = _all_gather_patches(local_x, self.world_size)
 
         B, C, T, local_H, local_W = local_x.shape
         full_H = local_H * self.h_split
@@ -109,21 +168,13 @@ class VAEParallelContext:
         my_bottom_rows = data[:, :, :, -pad_h:, :].contiguous()
 
         if self.h_split > 1:
-            # Send bottom rows down, receive top rows from above
-            if bottom_neighbor < self.h_split:
-                dst = bottom_neighbor * self.w_split + self.w_rank
-                dist.send(my_bottom_rows, dst=dst)
-            if top_neighbor >= 0:
-                src = top_neighbor * self.w_split + self.w_rank
-                dist.recv(top_pad, src=src)
+            top_src = top_neighbor * self.w_split + self.w_rank if top_neighbor >= 0 else None
+            bottom_dst = bottom_neighbor * self.w_split + self.w_rank if bottom_neighbor < self.h_split else None
+            _exchange_peer_tensors(bottom_dst, my_bottom_rows, top_src, top_pad)
 
-            # Send top rows up, receive bottom rows from below
-            if top_neighbor >= 0:
-                dst = top_neighbor * self.w_split + self.w_rank
-                dist.send(my_top_rows, dst=dst)
-            if bottom_neighbor < self.h_split:
-                src = bottom_neighbor * self.w_split + self.w_rank
-                dist.recv(bottom_pad, src=src)
+            top_dst = top_neighbor * self.w_split + self.w_rank if top_neighbor >= 0 else None
+            bottom_src = bottom_neighbor * self.w_split + self.w_rank if bottom_neighbor < self.h_split else None
+            _exchange_peer_tensors(top_dst, my_top_rows, bottom_src, bottom_pad)
 
         return torch.cat([top_pad, data, bottom_pad], dim=3)
 
@@ -143,19 +194,13 @@ class VAEParallelContext:
         my_right_cols = data[:, :, :, :, -pad_w:].contiguous()
 
         if self.w_split > 1:
-            if right_neighbor < self.w_split:
-                dst = self.h_rank * self.w_split + right_neighbor
-                dist.send(my_right_cols, dst=dst)
-            if left_neighbor >= 0:
-                src = self.h_rank * self.w_split + left_neighbor
-                dist.recv(left_pad, src=src)
+            right_dst = self.h_rank * self.w_split + right_neighbor if right_neighbor < self.w_split else None
+            left_src = self.h_rank * self.w_split + left_neighbor if left_neighbor >= 0 else None
+            _exchange_peer_tensors(right_dst, my_right_cols, left_src, left_pad)
 
-            if left_neighbor >= 0:
-                dst = self.h_rank * self.w_split + left_neighbor
-                dist.send(my_left_cols, dst=dst)
-            if right_neighbor < self.w_split:
-                src = self.h_rank * self.w_split + right_neighbor
-                dist.recv(right_pad, src=src)
+            left_dst = self.h_rank * self.w_split + left_neighbor if left_neighbor >= 0 else None
+            right_src = self.h_rank * self.w_split + right_neighbor if right_neighbor < self.w_split else None
+            _exchange_peer_tensors(left_dst, my_left_cols, right_src, right_pad)
 
         return torch.cat([left_pad, data, right_pad], dim=4)
 

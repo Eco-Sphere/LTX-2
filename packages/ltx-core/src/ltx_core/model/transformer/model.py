@@ -318,6 +318,7 @@ class LTXModel(torch.nn.Module):
                     idx=idx,
                     video=video_config,
                     audio=audio_config,
+                    is_last_block=idx == num_layers - 1,
                     rope_type=self.rope_type,
                     norm_eps=norm_eps,
                     attention_function=attention_type,
